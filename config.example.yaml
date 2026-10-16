@@ -1,0 +1,74 @@
+# Example config for cluster "cluster-a" in a 3-cluster ring: a -> b -> c -> a.
+# The same image runs everywhere; only this file (and SYNTHMON_CLUSTER) differs.
+cluster: cluster-a
+interval_seconds: 15          # direct probe cadence per target
+jitter_seconds: 5             # avoids synchronized probing across clusters
+timeout_seconds: 5
+control_plane_interval_seconds: 30
+
+# Direct pair probes: the primary signal. Each reports source/dest/result.
+# URLs go through the local sidecar upstream listener (or a virtual peer DNS name).
+targets:
+  - name: cluster-b
+    url: http://localhost:9091        # upstream: synthmon in peer cluster-b
+  - name: cluster-c
+    url: http://localhost:9092
+  # Negative intention test: this call MUST be denied. A successful call raises an alert.
+  - name: cluster-b
+    url: http://localhost:9093        # upstream to a denied-probe service in cluster-b
+    expect: denied
+
+# Secondary "deep path" test: a request travels the whole ring, with per-hop reporting.
+chain:
+  enabled: true
+  initiate: true
+  interval_seconds: 60
+  timeout_seconds: 15
+  max_hops: 16
+  expected_clusters: [cluster-a, cluster-b, cluster-c]
+  next:
+    name: cluster-b
+    url: http://localhost:9091
+
+consul:
+  http_addr: http://127.0.0.1:8500
+  token_env: CONSUL_HTTP_TOKEN
+  # partition: synthmon
+  # namespace: synthmon
+
+peering:
+  enabled: true
+  max_heartbeat_age_seconds: 120
+  expected:
+    - name: cluster-b
+      exported: [synthmon, synthmon-canary]
+      imported: [synthmon, synthmon-canary]
+    - name: cluster-c
+      exported: [synthmon, synthmon-canary]
+      imported: [synthmon, synthmon-canary]
+
+servers:
+  enabled: true
+  mesh_gateways: [mesh-gateway]
+  min_gateway_instances: 2
+
+canary:
+  enabled: true
+  service_name: synthmon-canary
+  interval_seconds: 30
+  peers: [cluster-b, cluster-c]
+
+dns:
+  enabled: true
+  server: 127.0.0.1:8600
+  names:
+    - {name: synthmon.service.consul, type: A}
+    - {name: synthmon.virtual.cluster-b.consul, type: A}
+
+envoy:
+  enabled: true
+  admin_addr: http://127.0.0.1:19000
+
+heartbeat:                    # optional dead-man's-switch ping to an external service
+  push_url: null
+  interval_seconds: 60

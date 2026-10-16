@@ -1,0 +1,134 @@
+# Deploy this in EVERY cluster. Per-cluster values: SYNTHMON_CLUSTER, the ConfigMap's
+# targets/chain.next/peering/canary lists, and the upstream annotation.
+# Peer upstream annotation syntax and CRD fields depend on your consul-k8s version; verify them.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: synthmon
+  namespace: synthmon
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synthmon-config
+  namespace: synthmon
+data:
+  config.yaml: |
+    cluster: cluster-a            # overridden by SYNTHMON_CLUSTER
+    targets:
+      - {name: cluster-b, url: "http://localhost:9091"}
+      - {name: cluster-c, url: "http://localhost:9092"}
+    chain:
+      enabled: true
+      expected_clusters: [cluster-a, cluster-b, cluster-c]
+      next: {name: cluster-b, url: "http://localhost:9091"}
+    consul:
+      http_addr: https://consul-server.consul.svc:8501
+      ca_file: /consul/ca/tls.crt
+      token_env: CONSUL_HTTP_TOKEN
+    peering:
+      expected:
+        - {name: cluster-b, exported: [synthmon, synthmon-canary], imported: [synthmon, synthmon-canary]}
+        - {name: cluster-c, exported: [synthmon, synthmon-canary], imported: [synthmon, synthmon-canary]}
+    servers: {mesh_gateways: [mesh-gateway], min_gateway_instances: 2}
+    canary: {enabled: true, peers: [cluster-b, cluster-c]}
+    dns:
+      enabled: true
+      server: consul-dns.consul.svc:53
+      names:
+        - {name: synthmon.service.consul, type: A}
+    envoy: {admin_addr: "http://127.0.0.1:19000"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synthmon
+  namespace: synthmon
+spec:
+  replicas: 1   # one prober per cluster keeps probe volume predictable; run 2 for HA (metrics are per-pod)
+  selector:
+    matchLabels: {app: synthmon}
+  template:
+    metadata:
+      labels: {app: synthmon}
+      annotations:
+        consul.hashicorp.com/connect-inject: "true"
+        # <service>.svc.<namespace>.ns.<peer>.peer:<local-port>
+        consul.hashicorp.com/connect-service-upstreams: >-
+          synthmon.svc.synthmon.ns.cluster-b.peer:9091,
+          synthmon.svc.synthmon.ns.cluster-c.peer:9092
+        consul.hashicorp.com/service-metrics-port: "8080"
+        consul.hashicorp.com/service-metrics-path: /metrics
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: synthmon
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: synthmon
+          image: REGISTRY/synthmon:0.1.0   # build with the provided Dockerfile
+          ports: [{containerPort: 8080, name: http}]
+          env:
+            - {name: SYNTHMON_CLUSTER, value: cluster-a}
+            - {name: SYNTHMON_VERSION, value: 0.1.0}
+            - name: CONSUL_HTTP_TOKEN
+              valueFrom: {secretKeyRef: {name: synthmon-consul-token, key: token}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/synthmon}
+            - {name: consul-ca, mountPath: /consul/ca, readOnly: true}
+          readinessProbe: {httpGet: {path: /readyz, port: 8080}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 192Mi}
+      volumes:
+        - name: config
+          configMap: {name: synthmon-config}
+        - name: consul-ca
+          secret: {secretName: consul-ca-cert}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: synthmon
+  namespace: synthmon
+spec:
+  selector: {app: synthmon}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: consul.hashicorp.com/v1alpha1
+kind: ServiceDefaults
+metadata:
+  name: synthmon
+  namespace: synthmon
+spec:
+  protocol: http   # required for L7 metrics and the x-forwarded-client-cert identity header
+---
+# Only the synthmon service of peer clusters may call this one. Any other source is denied,
+# which is what the optional negative-intention probe verifies.
+apiVersion: consul.hashicorp.com/v1alpha1
+kind: ServiceIntentions
+metadata:
+  name: synthmon
+  namespace: synthmon
+spec:
+  destination: {name: synthmon}
+  sources:
+    - {name: synthmon, peer: cluster-b, action: allow}
+    - {name: synthmon, peer: cluster-c, action: allow}
+    - {name: "*", action: deny}
+---
+# The canary is registered by synthmon itself; export it with the service so peers can read it.
+apiVersion: consul.hashicorp.com/v1alpha1
+kind: ExportedServices
+metadata:
+  name: default
+spec:
+  services:
+    - name: synthmon
+      namespace: synthmon
+      consumers: [{peer: cluster-b}, {peer: cluster-c}]
+    - name: synthmon-canary
+      namespace: synthmon
+      consumers: [{peer: cluster-b}, {peer: cluster-c}]

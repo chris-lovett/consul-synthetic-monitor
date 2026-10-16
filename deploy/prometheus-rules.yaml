@@ -1,0 +1,156 @@
+groups:
+  - name: synthmon.dataplane
+    rules:
+      - alert: SynthmonPairProbeFailing
+        expr: max by (source_cluster, dest_cluster, probe) (synthmon_probe_up) == 0
+        for: 3m   # several consecutive failed probes; mesh gateways restart transiently
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.source_cluster }} -> {{ $labels.dest_cluster }} ({{ $labels.probe }}) failing"
+          description: >-
+            Break down by cause: sum by (failure_type)
+            (increase(synthmon_probe_total{source_cluster="{{ $labels.source_cluster }}",dest_cluster="{{ $labels.dest_cluster }}",result="failure"}[5m]))
+
+      - alert: SynthmonNegativeIntentionAllowed
+        expr: increase(synthmon_probe_total{probe="negative_intention",failure_type="unexpected_allow"}[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A call that should be denied by intentions succeeded ({{ $labels.source_cluster }} -> {{ $labels.dest_cluster }})"
+
+      - alert: SynthmonPairLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le, source_cluster, dest_cluster)
+            (rate(synthmon_probe_duration_seconds_bucket{probe="direct"}[10m]))) > 1
+        for: 15m
+        labels: {severity: ticket}
+        annotations: {summary: "p95 {{ $labels.source_cluster }} -> {{ $labels.dest_cluster }} above 1s"}
+
+      - alert: SynthmonIdentityMismatch
+        expr: synthmon_probe_identity_ok == 0
+        for: 2m
+        labels: {severity: page}
+        annotations: {summary: "Unexpected mTLS client identity seen by {{ $labels.dest_cluster }}"}
+
+      - alert: SynthmonChainBroken
+        expr: synthmon_chain_up == 0
+        for: 3m
+        labels: {severity: page}
+        annotations:
+          summary: "Ring chain from {{ $labels.origin }} failing"
+          description: "Find the failing hop: synthmon_chain_hop_up{origin=\"{{ $labels.origin }}\"} == 0"
+
+  - name: synthmon.controlplane
+    rules:
+      - alert: ConsulPeeringNotActive
+        expr: synthmon_consul_peering_up == 0
+        for: 2m
+        labels: {severity: page}
+        annotations: {summary: "Peering {{ $labels.peer }} is not ACTIVE (reported by {{ $labels.instance }})"}
+
+      - alert: ConsulPeeringHeartbeatStale
+        expr: synthmon_consul_peering_heartbeat_age_seconds > 120
+        for: 2m
+        labels: {severity: page}
+        annotations: {summary: "No peering heartbeat from {{ $labels.peer }} for >2m"}
+
+      - alert: ConsulExportedServiceMissing
+        expr: synthmon_consul_peering_expected_service_missing == 1
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $labels.service }} not {{ $labels.direction }} on peering {{ $labels.peer }} (config drift)"
+
+      - alert: ConsulNoRaftLeader
+        expr: synthmon_consul_raft_leader_present == 0
+        for: 1m
+        labels: {severity: page}
+        annotations: {summary: "Consul cluster has no leader"}
+
+      - alert: ConsulAutopilotUnhealthy
+        expr: synthmon_consul_autopilot_healthy == 0 or synthmon_consul_server_healthy == 0
+        for: 3m
+        labels: {severity: page}
+        annotations: {summary: "Consul autopilot reports unhealthy server(s)"}
+
+      - alert: ConsulMeshGatewayBelowMinimum
+        expr: synthmon_consul_mesh_gateway_below_minimum == 1
+        for: 3m
+        labels: {severity: page}
+        annotations: {summary: "Mesh gateway {{ $labels.service }} has fewer passing instances than required"}
+
+      - alert: ConsulCanaryStale
+        expr: synthmon_canary_age_seconds > 180
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "Canary from {{ $labels.origin }} not propagating to {{ $labels.observer }} (control plane/peering stream)"
+
+      - alert: ConsulCanaryPropagationSlow
+        expr: histogram_quantile(0.95, sum by (le, origin, observer) (rate(synthmon_canary_propagation_seconds_bucket[30m]))) > 30
+        for: 10m
+        labels: {severity: ticket}
+        annotations: {summary: "Canary propagation {{ $labels.origin }} -> {{ $labels.observer }} p95 above 30s"}
+
+      - alert: ConsulAclTokenFailing
+        expr: synthmon_consul_acl_token_ok == 0
+        for: 3m
+        labels: {severity: page}
+        annotations: {summary: "synthmon ACL token no longer resolves (expired, revoked, or replication broken)"}
+
+      - alert: ConsulDnsFailing
+        expr: synthmon_dns_up == 0
+        for: 3m
+        labels: {severity: page}
+        annotations: {summary: "DNS name {{ $labels.name }} ({{ $labels.type }}) not resolving"}
+
+  - name: synthmon.certs
+    rules:
+      - alert: ConsulCertExpiringSoon
+        expr: |
+          synthmon_envoy_cert_expiry_seconds < 6 * 3600
+          or synthmon_consul_ca_root_expiry_seconds < 30 * 86400
+        for: 10m
+        labels: {severity: ticket}
+        annotations: {summary: "Sidecar certificate (<6h) or CA root (<30d) nearing expiry; rotation may be stuck"}
+
+      - alert: ConsulCaRotationLingering
+        expr: synthmon_consul_ca_roots > 1
+        for: 24h
+        labels: {severity: ticket}
+        annotations: {summary: "More than one trusted CA root for over 24h"}
+
+      - alert: ConsulLicenseExpiring
+        expr: synthmon_consul_license_expiry_seconds < 30 * 86400
+        labels: {severity: ticket}
+        annotations: {summary: "Consul Enterprise license expires in under 30 days"}
+
+      - alert: EnvoyXdsRejecting
+        expr: increase(synthmon_envoy_xds_updates_rejected[10m]) > 0 or synthmon_envoy_xds_connected == 0
+        for: 5m
+        labels: {severity: page}
+        annotations: {summary: "Sidecar is NACKing xDS config or disconnected from its control plane"}
+
+  - name: synthmon.monitor
+    rules:
+      # Dead-man's switch: the monitor reports on everything else, so alert when it goes quiet.
+      - alert: SynthmonMissing
+        expr: absent(synthmon_build_info) or (time() - synthmon_check_last_run_timestamp_seconds{check="servers"}) > 300
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "synthmon is not reporting. A whole cluster being down looks like this; check peers' pair probes."
+
+      - alert: SynthmonClusterUnreachableFromPeers
+        # Independent signal: every peer that probes us fails, regardless of whether we report.
+        expr: |
+          count by (dest_cluster) (synthmon_probe_up{probe="direct"} == 0)
+            >= count by (dest_cluster) (synthmon_probe_up{probe="direct"})
+        for: 3m
+        labels: {severity: page}
+        annotations: {summary: "All peers fail to reach {{ $labels.dest_cluster }}"}
+
+      - alert: SynthmonCheckErroring
+        expr: synthmon_check_up == 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations: {summary: "synthmon check {{ $labels.check }} is erroring (permissions, endpoint, or config)"}
